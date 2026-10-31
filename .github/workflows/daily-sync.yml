@@ -1,0 +1,28 @@
+name: Daily paper sync (BTC + ETH Signal -> Alpaca paper)
+
+on:
+  schedule:
+    - cron: "10 0 * * *"    # 00:10 UTC, right after the daily close (6:10 pm Chicago in winter)
+    - cron: "10 3 * * *"    # backup run 3 hours later (does nothing if the first run already matched)
+  workflow_dispatch: {}      # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: read             # the job can only read this repo, never change it
+
+concurrency:
+  group: paper-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Sync the Alpaca paper account to today's signal
+        run: python3 -I cloud_sync.py   # standard library only, so the runner's built-in Python is enough
+        env:
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
