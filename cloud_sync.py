@@ -105,6 +105,49 @@ def alpaca(method, path, body=None):
     raise RuntimeError("Alpaca rejected the keys or did not respond (use PAPER keys)")
 
 
+PRICE_CAP = 0.003                                     # pay at most 0.3% above the ask (or get 0.3% below the bid)
+DATA_API = "https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols="
+
+
+def quote(symbol):
+    """Latest bid/ask from Alpaca's crypto data (falls back to Coinbase's ticker)."""
+    try:
+        req = urllib.request.Request(DATA_API + urllib.parse.quote(symbol), headers=_headers(_AUTH["mode"] or "keys"))
+        with urllib.request.urlopen(req, timeout=20) as r:
+            q = json.load(r)["quotes"][symbol]
+        if q.get("bp") and q.get("ap"): return float(q["bp"]), float(q["ap"])
+    except Exception:
+        pass
+    with urllib.request.urlopen(urllib.request.Request(
+            f"https://api.exchange.coinbase.com/products/{symbol.replace('/', '-')}/ticker",
+            headers={"User-Agent": "paper-bot"}), timeout=20) as r:
+        t = json.load(r)
+    return float(t["bid"]), float(t["ask"])
+
+
+def place(symbol, side, qty_str=None, dollars=None):
+    """Price-capped order that fills right away or is cancelled (limit + IOC), then confirmed.
+    Returns a short text: what filled, or why nothing did (the next hourly run tries again)."""
+    bid, ask = quote(symbol)
+    if side == "buy":
+        limit = round(ask * (1 + PRICE_CAP), 2)
+        qty_str = f"{math.floor(dollars / limit * 1e8) / 1e8:.8f}"
+    else:
+        limit = round(bid * (1 - PRICE_CAP), 2)
+    o = alpaca("POST", "/v2/orders", {"symbol": symbol, "qty": qty_str, "side": side, "type": "limit",
+                                      "limit_price": f"{limit:.2f}", "time_in_force": "ioc"})
+    for _ in range(15):                                   # confirm: wait up to ~30 s for a final status
+        if o.get("status") in ("filled", "canceled", "expired", "rejected"): break
+        time.sleep(2); o = alpaca("GET", f"/v2/orders/{o['id']}")
+    filled = float(o.get("filled_qty") or 0)
+    if o.get("status") not in ("filled", "canceled", "expired", "rejected"):
+        alpaca("DELETE", f"/v2/orders/{o['id']}")         # never leave an order hanging
+    if filled > 0:
+        part = "" if o.get("status") == "filled" else " (partly)"
+        return f"filled{part} {filled:.6f} at ${float(o['filled_avg_price']):,.2f}"
+    return f"NOT filled ({o.get('status')}; price moved more than {PRICE_CAP * 100:.1f}%), will retry next hour"
+
+
 def main():
     dry = "--dry" in sys.argv
     if not all(_keys()):
@@ -112,6 +155,11 @@ def main():
     acct = alpaca("GET", "/v2/account")
     if acct.get("crypto_status") not in (None, "ACTIVE"):
         sys.exit(f"Crypto trading is not active on this paper account ({acct.get('crypto_status')})")
+    stale = alpaca("GET", "/v2/orders?status=open")
+    if stale and not dry:                       # safeguard: never trade on top of an order that is still open
+        alpaca("DELETE", "/v2/orders"); time.sleep(3)
+        print(f"Cancelled {len(stale)} leftover open order(s) before trading.")
+        acct = alpaca("GET", "/v2/account")
     eq = float(acct["equity"])
     pos = {p["symbol"].replace("/", ""): p for p in alpaca("GET", "/v2/positions")}
     lines = [f"## Paper sync {datetime.now(UTC):%Y-%m-%d %H:%M} UTC {'(DRY RUN)' if dry else ''}",
@@ -133,34 +181,31 @@ def main():
     actions = []
     for c, frac, val, qty, diff, px in plan:                               # sells first
         if qty > 0 and frac == 0:
-            actions.append(f"SELL all {SYMBOL[c]} (${val:,.2f})")
-            if not dry: alpaca("DELETE", f"/v2/positions/{SYMBOL[c].replace('/', '')}")
+            actions.append(f"SELL all {SYMBOL[c]} (${val:,.2f})" + ("" if dry else ": " +
+                           place(SYMBOL[c], "sell", qty_str=pos[SYMBOL[c].replace('/', '')]["qty"])))
         elif qty > 0 and diff < -max(MIN_CHANGE * eq, 10):
             q = math.floor(min(qty, -diff / px) * 1e8) / 1e8          # round down: never sell more than we hold
-            actions.append(f"SELL {q:.6f} {SYMBOL[c]} (${-diff:,.2f})")
-            if not dry: alpaca("POST", "/v2/orders", {"symbol": SYMBOL[c], "qty": f"{q:.8f}", "side": "sell",
-                                                      "type": "market", "time_in_force": "gtc"})
+            actions.append(f"SELL {q:.6f} {SYMBOL[c]} (${-diff:,.2f})" + ("" if dry else ": " +
+                           place(SYMBOL[c], "sell", qty_str=f"{q:.8f}")))
     wanted = {SYMBOL[c].replace("/", "") for c in COINS}
     for key, p in pos.items():                                             # sell any coin no longer in the plan
         if key not in wanted:
-            actions.append(f"SELL all {p['symbol']} (${float(p['market_value']):,.2f}, no longer traded)")
-            if not dry: alpaca("DELETE", f"/v2/positions/{key}")
-    if actions and not dry: time.sleep(5)
+            actions.append(f"SELL all {p['symbol']} (${float(p['market_value']):,.2f}, no longer traded)" +
+                           ("" if dry else ": " + place(p["symbol"], "sell", qty_str=p["qty"])))
     for c, frac, val, qty, diff, px in plan:                               # then buys
         if frac > 0 and diff > max(MIN_CHANGE * eq, 10):
             cash = float(alpaca("GET", "/v2/account")["cash"])
-            amt = min(diff, cash * 0.99)
+            amt = min(diff, cash * 0.98)                                  # leave room for the price cap and fee
             if amt < 10: continue
-            actions.append(f"BUY {SYMBOL[c]} for ${amt:,.2f}")
-            if not dry: alpaca("POST", "/v2/orders", {"symbol": SYMBOL[c], "notional": f"{amt:.2f}", "side": "buy",
-                                                      "type": "market", "time_in_force": "gtc"})
+            actions.append(f"BUY {SYMBOL[c]} for ${amt:,.2f}" + ("" if dry else ": " +
+                           place(SYMBOL[c], "buy", dollars=amt)))
     lines += ["", "Orders: " + ("; ".join(actions) if actions else "none (account already matches the signal)")]
     text = "\n".join(lines)
     print(text)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(text + "\n")
-    if actions and not dry: time.sleep(5)                                  # let fills settle before reporting
+    if actions and not dry: time.sleep(3)                                  # let the account update before reporting
     report(sig_rows, actions, dry)
 
 
