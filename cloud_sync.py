@@ -408,9 +408,41 @@ def gh(method, path, body=None):
         return json.load(r)
 
 
+def important_order_events():
+    """Email new resting limits, confirmed fills, and rejections, never hourly wait states."""
+    cutoff = datetime.now(UTC) - timedelta(days=2)
+    events = []
+    for order in history():
+        cid = str(order.get("client_order_id") or "")
+        if not cid.startswith((LIMIT_PREFIX, FALLBACK_PREFIX, EXIT_PREFIX)):
+            continue
+        if order.get("symbol", "").replace("/", "") != "BTCUSD":
+            continue
+        stamp = order.get("created_at") or order.get("submitted_at")
+        if not stamp or datetime.fromisoformat(stamp.replace("Z", "+00:00")) < cutoff:
+            continue
+        status = str(order.get("status") or "")
+        filled = float(order.get("filled_qty") or 0)
+        order_id = order["id"]
+        if status in TERMINAL and filled > 0:
+            kind = "filled"
+            desc = (f"BTC {order['side'].upper()} filled: {filled:.8f} BTC at "
+                    f"USD {float(order['filled_avg_price']):,.2f} ({status})")
+        elif status == "rejected":
+            kind = "rejected"
+            desc = f"BTC {order['side'].upper()} rejected; check Alpaca order {order_id}"
+        elif cid.startswith(LIMIT_PREFIX) and status not in TERMINAL:
+            kind = "placed"
+            desc = f"BTC {order['side'].upper()} resting limit submitted; awaiting fill for up to 3 hours"
+        else:
+            continue
+        events.append((f"<!-- btc-order:{order_id}:{kind} -->", desc))
+    return events
+
+
 def report(sig_rows, actions, dry):
     day, eq, body = build_report(sig_rows, actions)
-    weekly = datetime.fromisoformat(str(day)).weekday() == 6           # the Sunday close ends the week
+    weekly = datetime.fromisoformat(str(day)).weekday() == 6
     wbody = weekly_report(day, eq) if weekly else None
     repo = os.environ.get("GITHUB_REPOSITORY")
     if dry or not (repo and os.environ.get("GITHUB_TOKEN")):
@@ -421,14 +453,26 @@ def report(sig_rows, actions, dry):
                   if i["title"] == DAILY_TITLE and "pull_request" not in i), None)
     if not issue:
         issue = gh("POST", f"/repos/{repo}/issues", {"title": DAILY_TITLE, "body":
-                   "The cloud bot adds one comment here after each daily close; GitHub emails each one."})
+                   "One report after each daily close, plus important order changes. Hourly checks stay quiet."})
     since = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    done = any(mark in c["body"] for c in gh("GET", f"/repos/{repo}/issues/{issue['number']}/comments?since={since}&per_page=100"))
-    if not done or actions:                                             # one report per close (plus any trade update)
-        gh("POST", f"/repos/{repo}/issues/{issue['number']}/comments",
-           {"body": f"{mark}\n@{OWNER} Daily paper portfolio, {day} close\n\n{body}"})
-        print("Daily report posted.")
-    if wbody and not done:
+    comments = gh("GET", f"/repos/{repo}/issues/{issue['number']}/comments?since={since}&per_page=100")
+    bodies = [c.get("body") or "" for c in comments]
+    daily_done = any(mark in content for content in bodies)
+    new_events = [(marker, desc) for marker, desc in important_order_events()
+                  if not any(marker in content for content in bodies)]
+    # Waiting messages stay in the Actions log. Order events are idempotent across runs.
+    if not daily_done or new_events:
+        event_text = ("\n\n**Order changes**\n" +
+                      "\n".join(f"{marker}\n- {desc}" for marker, desc in new_events)) if new_events else ""
+        if not daily_done:
+            message = f"{mark}\n@{OWNER} Daily paper portfolio, {day} close\n\n{body}{event_text}"
+        else:
+            message = f"{mark}\n@{OWNER} BTC paper order update\n{event_text}"
+        gh("POST", f"/repos/{repo}/issues/{issue['number']}/comments", {"body": message})
+        print("Posted daily report or new order event.")
+    else:
+        print("Hourly check complete: no email (daily report and events already sent).")
+    if wbody and not daily_done:
         gh("POST", f"/repos/{repo}/issues", {"title": f"Weekly portfolio report: week ending {day}",
                                              "body": f"@{OWNER}\n\n{wbody}"})
         print("Weekly report posted.")
