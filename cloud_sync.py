@@ -6,7 +6,7 @@ account match it. Running it twice is harmless — if the account already matche
 
 Signal (same rules as the TradingView "BTC + ETH Signal"):
   OWN a coin when it is higher than 28 days ago AND above its 100-day average, else CASH.
-  Alpaca lends nothing for crypto, so each coin is held at most at its share: Bitcoin 70%, Ethereum 30%
+  Bitcoin only (since 2026-11-01). Alpaca lends nothing for crypto, so it holds at most 100% of the account
   (smaller when the coin is very volatile: share x min(1, 100% / yearly volatility)).
 
 Keys: environment variables ALPACA_KEY_ID and ALPACA_SECRET_KEY (GitHub repository secrets). Never printed.
@@ -15,7 +15,7 @@ Usage: python -I cloud_sync.py [--dry]
 import json, math, os, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 
-COINS = {"BTC-USD": 0.70, "ETH-USD": 0.30}
+COINS = {"BTC-USD": 1.00}                            # Bitcoin only since 2026-11-01 (was 70% BTC / 30% ETH)
 LOOK, MA, VOL_TARGET = 28, 100, 1.00
 ALPACA = "https://paper-api.alpaca.markets"          # PAPER ONLY — orders can never reach a real-money account
 assert ALPACA.startswith("https://paper-api.")
@@ -140,6 +140,11 @@ def main():
             actions.append(f"SELL {q:.6f} {SYMBOL[c]} (${-diff:,.2f})")
             if not dry: alpaca("POST", "/v2/orders", {"symbol": SYMBOL[c], "qty": f"{q:.8f}", "side": "sell",
                                                       "type": "market", "time_in_force": "gtc"})
+    wanted = {SYMBOL[c].replace("/", "") for c in COINS}
+    for key, p in pos.items():                                             # sell any coin no longer in the plan
+        if key not in wanted:
+            actions.append(f"SELL all {p['symbol']} (${float(p['market_value']):,.2f}, no longer traded)")
+            if not dry: alpaca("DELETE", f"/v2/positions/{key}")
     if actions and not dry: time.sleep(5)
     for c, frac, val, qty, diff, px in plan:                               # then buys
         if frac > 0 and diff > max(MIN_CHANGE * eq, 10):
