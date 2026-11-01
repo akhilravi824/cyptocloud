@@ -2,8 +2,9 @@ name: Daily paper sync (BTC + ETH Signal -> Alpaca paper)
 
 on:
   schedule:
-    - cron: "10 0 * * *"    # 00:10 UTC, right after the daily close (6:10 pm Chicago in winter)
-    - cron: "10 3 * * *"    # backup run 3 hours later (does nothing if the first run already matched)
+    - cron: "10 * * * *"    # every hour at :10. Decisions use only FINISHED daily closes, so the first run after
+                             # the 00:00 UTC close trades if the signal changed; the other runs find nothing to do
+                             # and act as backups if GitHub delays or skips a run. One email per daily close.
   workflow_dispatch: {}      # lets you run it by hand from the Actions tab
 
 permissions:

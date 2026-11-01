@@ -1,6 +1,6 @@
 # Crypto paper bot (cloud)
 
-Every day right after the UTC daily close, GitHub Actions runs `cloud_sync.py`, which:
+Every hour GitHub Actions runs `cloud_sync.py` (only the first run after each UTC daily close can trade), which:
 
 1. downloads Bitcoin daily prices from Coinbase (public data),
 2. applies the "BTC + ETH Signal" rules (own a coin when it is above its price 28 days ago **and** above its 100-day average),
