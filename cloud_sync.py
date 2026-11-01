@@ -118,7 +118,7 @@ def main():
              f"Alpaca paper account: ${eq:,.2f}", "",
              "| Coin | Last close | 28-day change | vs 100-day avg | Signal | Target | Holding now |",
              "|---|---|---|---|---|---|---|"]
-    plan = []
+    plan, sig_rows = [], []
     for c, share in COINS.items():
         days, closes = daily_closes(c)
         on, size, m, dma = signal(closes)
@@ -127,6 +127,7 @@ def main():
         val = float(pos[key]["market_value"]) if key in pos else 0.0
         qty = float(pos[key]["qty"]) if key in pos else 0.0
         plan.append((c, frac, val, qty, frac * eq - val, closes[-1]))
+        sig_rows.append((c, days[-1], closes[-1], m, dma, on, frac))
         lines.append(f"| {c[:3]} | {days[-1]} ${closes[-1]:,.0f} | {m * 100:+.1f}% | {dma * 100:+.1f}% | "
                      f"{'OWN' if on else 'CASH'} | {frac * 100:.0f}% | ${val:,.2f} |")
     actions = []
@@ -154,6 +155,108 @@ def main():
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(text + "\n")
+    if actions and not dry: time.sleep(5)                                  # let fills settle before reporting
+    report(sig_rows, actions, dry)
+
+
+# ---------------- daily / weekly portfolio report (emailed by GitHub) ----------------
+START = 1000.00                                        # the paper account started with $1,000
+OWNER = "akhilravi824"                                 # @mentioned so GitHub emails every report
+DAILY_TITLE = "Daily portfolio report"
+NAMES = {"BTC-USD": "Bitcoin", "ETH-USD": "Ethereum"}
+
+
+def money(x, sign=False):
+    return (f"{'+' if x >= 0 else '-'}" if sign else ("-" if x < 0 else "")) + f"${abs(x):,.2f}"
+
+
+def value_days_ago(days):
+    """Account value at the end of the day `days` ago, from Alpaca's own daily history (None if unknown)."""
+    h = alpaca("GET", "/v2/account/portfolio/history?period=1M&timeframe=1D")
+    cutoff = time.time() - days * 86400
+    pts = [(t, e) for t, e in zip(h.get("timestamp") or [], h.get("equity") or []) if e and t <= cutoff]
+    return pts[-1][1] if pts else None
+
+
+def build_report(sig_rows, actions):
+    acct = alpaca("GET", "/v2/account")
+    eq, cash = float(acct["equity"]), float(acct["cash"])
+    pos = {p["symbol"].replace("/", ""): p for p in alpaca("GET", "/v2/positions")}
+    day = sig_rows[0][1]
+    d1, d7 = value_days_ago(1), value_days_ago(7)
+    total = eq - START
+    lines = [f"**Portfolio value: {money(eq)}**", "",
+             "| | Change |", "|---|---|",
+             f"| Today | {money(eq - d1, True) if d1 else 'n/a'} |",
+             f"| Last 7 days | {money(eq - d7, True) + f' ({(eq / d7 - 1) * 100:+.1f}%)' if d7 else 'n/a'} |",
+             f"| Since start ($1,000) | {money(total, True)} ({total / START * 100:+.1f}%) |", "",
+             "| Holding | Amount | Value | Profit on it |", "|---|---|---|---|"]
+    for c in COINS:
+        p = pos.get(SYMBOL[c].replace("/", ""))
+        if p:
+            lines.append(f"| {NAMES[c]} | {float(p['qty']):.6f} | {money(float(p['market_value']))} | "
+                         f"{money(float(p['unrealized_pl']), True)} |")
+    lines += [f"| Cash | | {money(cash)} | |", "",
+              f"Signal at the {day} close (UTC):", "",
+              "| Coin | Close | vs 28 days ago | vs 100-day avg | Signal |", "|---|---|---|---|---|"]
+    for c, d, px, m, dma, on, frac in sig_rows:
+        lines.append(f"| {NAMES[c]} | ${px:,.0f} | {m * 100:+.1f}% | {dma * 100:+.1f}% | "
+                     f"{'BUY / OWN ' + format(frac * 100, '.0f') + '%' if on else 'CASH'} |")
+    lines += ["", "Orders this run: " + ("; ".join(actions) if actions else "none")]
+    return day, eq, "\n".join(lines)
+
+
+def weekly_report(day, eq):
+    d7 = value_days_ago(7)
+    since = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    orders = alpaca("GET", f"/v2/orders?status=closed&after={since}&limit=100&direction=asc")
+    fills = [o for o in orders if o.get("filled_avg_price")]
+    total = eq - START
+    lines = [f"**Week ending {day}: portfolio {money(eq)}**", "",
+             "| | |", "|---|---|",
+             f"| Value 7 days ago | {money(d7) if d7 else 'n/a'} |",
+             f"| Profit this week | {money(eq - d7, True) + f' ({(eq / d7 - 1) * 100:+.1f}%)' if d7 else 'n/a'} |",
+             f"| Profit since start ($1,000) | {money(total, True)} ({total / START * 100:+.1f}%) |", "",
+             f"Trades this week: {len(fills)}"]
+    for o in fills:
+        lines.append(f"- {o['filled_at'][:10]} {o['side'].upper()} {o['symbol']}: "
+                     f"{float(o['filled_qty']):.6f} at ${float(o['filled_avg_price']):,.2f}")
+    return "\n".join(lines)
+
+
+def gh(method, path, body=None):
+    req = urllib.request.Request("https://api.github.com" + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                                          "Accept": "application/vnd.github+json", "User-Agent": "paper-bot"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def report(sig_rows, actions, dry):
+    day, eq, body = build_report(sig_rows, actions)
+    weekly = datetime.fromisoformat(str(day)).weekday() == 6           # the Sunday close ends the week
+    wbody = weekly_report(day, eq) if weekly else None
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if dry or not (repo and os.environ.get("GITHUB_TOKEN")):
+        print("\n--- daily report (not posted) ---\n" + body + ("\n\n--- weekly report ---\n" + wbody if wbody else ""))
+        return
+    mark = f"<!-- close:{day} -->"
+    issue = next((i for i in gh("GET", f"/repos/{repo}/issues?state=open&per_page=100")
+                  if i["title"] == DAILY_TITLE and "pull_request" not in i), None)
+    if not issue:
+        issue = gh("POST", f"/repos/{repo}/issues", {"title": DAILY_TITLE, "body":
+                   "The cloud bot adds one comment here after each daily close; GitHub emails each one."})
+    since = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    done = any(mark in c["body"] for c in gh("GET", f"/repos/{repo}/issues/{issue['number']}/comments?since={since}&per_page=100"))
+    if not done or actions:                                             # one report per close (plus any trade update)
+        gh("POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+           {"body": f"{mark}\n@{OWNER} Daily paper portfolio, {day} close\n\n{body}"})
+        print("Daily report posted.")
+    if wbody and not done:
+        gh("POST", f"/repos/{repo}/issues", {"title": f"Weekly portfolio report: week ending {day}",
+                                             "body": f"@{OWNER}\n\n{wbody}"})
+        print("Weekly report posted.")
 
 
 if __name__ == "__main__":

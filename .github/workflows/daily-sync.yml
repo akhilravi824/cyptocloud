@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read             # the job can only read this repo, never change it
+  issues: write              # posts the daily/weekly portfolio report (GitHub emails it)
 
 concurrency:
   group: paper-sync
@@ -26,3 +27,4 @@ jobs:
         env:
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
